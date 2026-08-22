@@ -1,0 +1,30 @@
+# secrets
+.env
+
+# generated data
+data/
+videos/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# os / editor
+.DS_Store
+.vscode/
+.idea/
+
+# tool caches
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

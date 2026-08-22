@@ -1,0 +1,11 @@
+# Runtime dependencies (mirrors [project.dependencies] in pyproject.toml).
+# For development, prefer:  pip install -e ".[dev]"
+opencv-python>=4.9
+numpy>=1.24
+easyocr>=1.7
+faster-whisper>=1.0
+sentence-transformers>=2.7
+faiss-cpu>=1.8
+openai>=1.30
+python-dotenv>=1.0
+torch>=2.1

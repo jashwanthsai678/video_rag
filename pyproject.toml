@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-rag"
+version = "0.2.0"
+description = "Retrieval-Augmented Generation over screen-recording videos: ask a question, get the matching clip and a step-by-step guide."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "opencv-python>=4.9",
+    "numpy>=1.24",
+    "easyocr>=1.7",
+    "faster-whisper>=1.0",
+    "sentence-transformers>=2.7",
+    "faiss-cpu>=1.8",
+    "openai>=1.30",
+    "python-dotenv>=1.0",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+# The ranking logic lives in dependency-free modules, so the test suite needs
+# almost nothing: numpy/faiss/opencv only for the integration tests, and no
+# model weights at all.
+test = [
+    "pytest>=8",
+    "numpy>=1.24",
+    "faiss-cpu>=1.8",
+    "opencv-python-headless>=4.9",
+]
+dev = ["video-rag[test]", "ruff>=0.5"]
+
+[project.scripts]
+videorag = "video_rag.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video_rag*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# No "UP": the codebase targets 3.9 and uses typing.List/Dict/Optional
+# consistently. Modernizing those annotations is churn, not a fix.
+select = ["E", "F", "W", "I", "B", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+# Integration tests import after a runtime importorskip guard by design.
+"tests/*" = ["E402"]
