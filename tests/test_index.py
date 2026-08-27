@@ -15,6 +15,7 @@ pytest.importorskip("faiss")
 
 from video_rag.config import Config  # noqa: E402
 from video_rag.index import IndexCompatibilityError, SemanticIndex  # noqa: E402
+from video_rag.retrieval import tokenize  # noqa: E402
 from video_rag.segment import Segment  # noqa: E402
 from video_rag.store import SegmentStore, inspect  # noqa: E402
 
@@ -281,3 +282,34 @@ class TestAddGuards:
         ])
         hits = index.search("reconcile ledger", top_k=5)
         assert any("ledger" in h.segment.text for h in hits)
+
+
+class TestTokenCache:
+    """`_tokens` is kept parallel to `segments` so `bm25` never has to
+    re-tokenize already-seen text on every mutation."""
+
+    def test_tokens_stay_aligned_with_segments_after_add(self):
+        index = make_index()
+        assert len(index._tokens) == len(index.segments)
+        assert index._tokens[0] == tokenize(index.segments[0].text)
+
+    def test_tokens_stay_aligned_with_segments_after_remove(self):
+        index = make_index()
+        index.remove_video("reports")
+        assert len(index._tokens) == len(index.segments)
+        assert index._tokens == [tokenize(s.text) for s in index.segments]
+
+    def test_tokens_survive_a_save_load_roundtrip(self, tmp_path):
+        index = make_index()
+        index.save(str(tmp_path / "idx"))
+
+        reloaded = SemanticIndex(index.config)
+        reloaded._model = FakeEncoder()
+        reloaded.load(str(tmp_path / "idx"))
+        assert reloaded._tokens == [tokenize(s.text) for s in reloaded.segments]
+
+    def test_removing_everything_empties_the_token_cache(self):
+        index = make_index()
+        index.remove_video("patients")
+        index.remove_video("reports")
+        assert index._tokens == []

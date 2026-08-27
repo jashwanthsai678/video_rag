@@ -75,7 +75,9 @@ class SpeechTranscriber:
             # An audio stream was present but couldn't actually be decoded
             # (corrupt/empty track). Same outcome as "no audio": OCR segments
             # for this video should still be indexed, not lost.
-            logger.warning("%s: audio track present but undecodable; skipping transcription", video_name)
+            logger.warning(
+                "%s: audio track present but undecodable; skipping transcription", video_name
+            )
             return []
 
         logger.info("%s: %d speech segment(s)", video_name, len(segments))

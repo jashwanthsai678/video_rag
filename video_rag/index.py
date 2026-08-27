@@ -53,6 +53,10 @@ class SemanticIndex:
         self._bm25: Optional[BM25] = None
         self.index = None
         self.segments: List[Segment] = []
+        # Tokenized in lockstep with `segments` (same indices) so `add()` only
+        # has to tokenize the segments actually being added, instead of the
+        # `bm25` property re-tokenizing the whole corpus on every mutation.
+        self._tokens: List[List[str]] = []
 
     # --- Lazy heavy dependencies --------------------------------------------
 
@@ -75,9 +79,16 @@ class SemanticIndex:
 
     @property
     def bm25(self) -> BM25:
-        """Built on demand, invalidated whenever segments change."""
+        """Built on demand, invalidated whenever segments change.
+
+        Rebuilt from the `_tokens` cache rather than re-tokenizing every
+        segment's text: BM25 itself has no incremental-IDF form (adding a
+        document changes every existing document's length-normalization
+        term), so a rebuild is unavoidable, but the tokenization work for
+        already-seen segments is not.
+        """
         if self._bm25 is None:
-            self._bm25 = BM25([tokenize(s.text) for s in self.segments])
+            self._bm25 = BM25(self._tokens)
         return self._bm25
 
     # --- Embedding -----------------------------------------------------------
@@ -109,6 +120,7 @@ class SemanticIndex:
             )
         self.index.add(vectors)
         self.segments.extend(segments)
+        self._tokens.extend(tokenize(s.text) for s in segments)
         self._bm25 = None
 
     def remove_video(self, video_name: str) -> int:
@@ -135,6 +147,7 @@ class SemanticIndex:
             self.index = None
 
         self.segments = [self.segments[i] for i in keep]
+        self._tokens = [self._tokens[i] for i in keep]
         self._bm25 = None
         logger.info("Removed %d segment(s) for %r", removed, video_name)
         return removed
@@ -259,6 +272,7 @@ class SemanticIndex:
 
         self.index = index
         self.segments = segments
+        self._tokens = [tokenize(s.text) for s in segments]
         self._bm25 = None
         logger.info("Loaded %d segment(s) from %s", len(segments), path)
         return True
