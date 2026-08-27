@@ -19,12 +19,16 @@ _LAZY_EXPORTS = {
     "Segment": ".segment",
     "SearchHit": ".index",
     "SemanticIndex": ".index",
+    "Database": ".db",
+    "Match": ".db",
 }
 
 __all__ = ["__version__", *sorted(_LAZY_EXPORTS)]
 
 if TYPE_CHECKING:  # pragma: no cover - hints only; never executed at runtime
     from .config import Config as Config
+    from .db import Database as Database
+    from .db import Match as Match
     from .index import SearchHit as SearchHit
     from .index import SemanticIndex as SemanticIndex
     from .pipeline import Located as Located

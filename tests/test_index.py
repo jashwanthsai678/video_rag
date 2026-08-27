@@ -6,7 +6,6 @@ the goal is to test *our* wiring (fusion, rebuild-on-remove, persistence,
 compatibility guards), not the quality of somebody else's weights.
 """
 
-import json
 import re
 
 import pytest
@@ -17,6 +16,7 @@ pytest.importorskip("faiss")
 from video_rag.config import Config  # noqa: E402
 from video_rag.index import IndexCompatibilityError, SemanticIndex  # noqa: E402
 from video_rag.segment import Segment  # noqa: E402
+from video_rag.store import SegmentStore, inspect  # noqa: E402
 
 VOCAB = [
     "patient", "new", "record", "export", "report",
@@ -198,11 +198,13 @@ class TestPersistence:
         assert not list((tmp_path / "idx").glob("*.tmp"))
 
     def test_metadata_records_the_embedding_model(self, tmp_path):
+        """Metadata is queryable via `inspect()` without loading FAISS/torch."""
         index = make_index()
         index.save(str(tmp_path / "idx"))
-        meta = json.loads((tmp_path / "idx" / "meta.json").read_text(encoding="utf-8"))
-        assert meta["embedding_model"] == index.config.embedding_model
-        assert meta["segment_count"] == len(SEGMENT_TEXTS)
+        report = inspect(str(tmp_path / "idx"))
+        assert report["embedding_model"] == index.config.embedding_model
+        assert report["total_segments"] == len(SEGMENT_TEXTS)
+        assert report["videos"] == {"patients": 3, "reports": 2}
 
     def test_changing_the_embedding_model_is_refused(self, tmp_path):
         """Regression: this used to load happily and then either assert deep
@@ -217,9 +219,9 @@ class TestPersistence:
     def test_vector_and_segment_count_mismatch_is_refused(self, tmp_path):
         index = make_index()
         index.save(str(tmp_path / "idx"))
-        path = tmp_path / "idx" / "segments.json"
-        truncated = json.loads(path.read_text(encoding="utf-8"))[:2]
-        path.write_text(json.dumps(truncated), encoding="utf-8")
+        # Simulate a truncated store: fewer metadata rows than FAISS vectors.
+        with SegmentStore(str(tmp_path / "idx" / "segments.db")) as store:
+            store.compact(store.all_segments()[:2])
 
         reloaded = SemanticIndex(index.config)
         with pytest.raises(IndexCompatibilityError, match="inconsistent"):

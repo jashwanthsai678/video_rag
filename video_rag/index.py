@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -13,13 +13,13 @@ import numpy as np
 from .config import Config
 from .retrieval import BM25, reciprocal_rank_fusion, tokenize
 from .segment import Segment
+from .store import SegmentStore
 
 logger = logging.getLogger(__name__)
 
 INDEX_FILE = "index.faiss"
-SEGMENTS_FILE = "segments.json"
-META_FILE = "meta.json"
-SCHEMA_VERSION = 2
+STORE_FILE = "segments.db"
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -192,15 +192,20 @@ class SemanticIndex:
         hits.sort(key=lambda h: (-h.fused, -h.score))
         return hits[:top_k]
 
-    # --- Persistence ---------------------------------------------------------
-
-    def _metadata(self) -> dict:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "embedding_model": self.config.embedding_model,
-            "dimension": int(self.index.d) if self.index is not None else 0,
-            "segment_count": len(self.segments),
-        }
+    # --- Persistence -----------------------------------------------------
+    #
+    # Metadata (which video, what second, what text) is stored in SQLite
+    # rather than a JSON array. The practical difference shows up in
+    # `video_rag.store.inspect()`: answering "what's indexed here" needs
+    # neither FAISS nor torch, just the standard library's sqlite3 module.
+    #
+    # This still writes the full segment list on every save() rather than
+    # streaming individual add()/remove_video() calls straight to disk — the
+    # session's in-memory `self.segments` list stays the single source of
+    # truth, matching how the FAISS index itself is only flushed to disk on
+    # save(). Making metadata durable *before* an explicit save() would leave
+    # it out of sync with not-yet-flushed vectors, which is worse than the
+    # current all-or-nothing save.
 
     def save(self, path: str) -> None:
         if self.index is None:
@@ -208,36 +213,34 @@ class SemanticIndex:
             return
 
         os.makedirs(path, exist_ok=True)
-        # Write to temporary files and swap, so an interrupted save can't leave
-        # a half-written index that fails to load next run.
+        # Write to a temporary file and swap, so an interrupted save can't
+        # leave a half-written index that fails to load next run.
         tmp_index = os.path.join(path, INDEX_FILE + ".tmp")
         self.faiss.write_index(self.index, tmp_index)
         os.replace(tmp_index, os.path.join(path, INDEX_FILE))
 
-        for name, payload in (
-            (SEGMENTS_FILE, [s.to_dict() for s in self.segments]),
-            (META_FILE, self._metadata()),
-        ):
-            tmp = os.path.join(path, name + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
-            os.replace(tmp, os.path.join(path, name))
+        store_path = os.path.join(path, STORE_FILE)
+        tmp_store = store_path + ".tmp"
+        Path(tmp_store).unlink(missing_ok=True)
+        with SegmentStore(tmp_store) as store:
+            store.compact(self.segments)
+            store.set_meta("schema_version", str(SCHEMA_VERSION))
+            store.set_meta("embedding_model", self.config.embedding_model)
+            store.set_meta("dimension", str(self.index.d))
+        os.replace(tmp_store, store_path)
 
         logger.info("Saved %d segment(s) to %s", len(self.segments), path)
 
     def load(self, path: str) -> bool:
         index_file = os.path.join(path, INDEX_FILE)
-        segments_file = os.path.join(path, SEGMENTS_FILE)
-        if not (os.path.exists(index_file) and os.path.exists(segments_file)):
+        store_file = os.path.join(path, STORE_FILE)
+        if not (os.path.exists(index_file) and os.path.exists(store_file)):
             return False
 
-        meta_file = os.path.join(path, META_FILE)
-        meta = {}
-        if os.path.exists(meta_file):
-            with open(meta_file, encoding="utf-8") as f:
-                meta = json.load(f)
+        with SegmentStore(store_file) as store:
+            saved_model = store.get_meta("embedding_model")
+            segments = store.all_segments()
 
-        saved_model = meta.get("embedding_model")
         if saved_model and saved_model != self.config.embedding_model:
             raise IndexCompatibilityError(
                 f"Index at {path} was built with embedding model {saved_model!r}, "
@@ -248,9 +251,6 @@ class SemanticIndex:
             )
 
         index = self.faiss.read_index(index_file)
-        with open(segments_file, encoding="utf-8") as f:
-            segments = [Segment.from_dict(d) for d in json.load(f)]
-
         if index.ntotal != len(segments):
             raise IndexCompatibilityError(
                 f"Index at {path} is inconsistent: {index.ntotal} vector(s) but "

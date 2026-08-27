@@ -111,7 +111,37 @@ videorag query "..." --no-clip     # retrieval only, skip ffmpeg
 videorag index --force             # re-index (replaces, does not duplicate)
 ```
 
-**Python**
+**Python — `Database` (recommended entry point)**
+
+An embedded, video-native database over the same FAISS + BM25 + SQLite
+engine described above — not a new engine, a friendlier shape for it.
+`search()` is deliberately pure data: no ffmpeg call, no LLM call, the same
+reason `SELECT` doesn't render a PDF. Cutting a clip and writing a guide are
+separate, explicit calls, so a caller who only wants retrieval never pays
+for either.
+
+```python
+from video_rag import Database
+
+db = Database("./my_video_vault")           # all state lives under this folder
+db.ingest_directory("./onboarding_videos")
+
+match = db.search("How do I invite a new teammate?")   # pure data — no side effects
+print(match.video_name, match.score, match.start_seconds, match.end_seconds)
+
+db.render_clip(match)                         # -> cuts with ffmpeg, on request
+db.explain(match, "How do I invite a new teammate?")   # -> LLM guide, on request
+
+db.videos          # ["onboarding"] — no FAISS/torch touched for this
+len(db)            # total indexed segments
+db.remove("onboarding")   # drop a video and its segments
+```
+
+**Python — `VideoRAGPipeline` (the underlying engine)**
+
+`Database` is a thin façade over this; use it directly if you want
+`query()`'s convenience of clip + guide in one call, or need lower-level
+access (per-hit scores, `found_by`, cluster count).
 
 ```python
 from video_rag import VideoRAGPipeline
@@ -131,6 +161,31 @@ for hit in found.hits:
 ```
 
 See `examples/quickstart.py` for a runnable end-to-end example.
+
+## Inspecting an index without the ML stack
+
+Segment metadata (which video, what second, what text) lives in SQLite
+rather than a JSON blob rewritten in full on every save. The concrete payoff:
+asking "what's in this index" doesn't need FAISS, sentence-transformers, or
+torch — just the standard library's `sqlite3`.
+
+```bash
+videorag inspect --index-path data/index
+```
+
+```
+Index           : data/index
+Embedding model : BAAI/bge-base-en-v1.5
+Total segments  : 214
+
+Videos:
+  onboarding                     87 segment(s)
+  patients                       127 segment(s)
+```
+
+This command imports neither `cv2` nor `torch` nor `faiss` — it's a pure
+`sqlite3` read, so it stays fast and dependency-light even as a health check
+in a CI pipeline or a lightweight status endpoint.
 
 ## Measuring retrieval quality
 
@@ -190,7 +245,8 @@ video_rag/
   config.py       Settings (env-var driven)
   segment.py      Shared data model (a retrievable moment)
   retrieval.py    BM25, rank fusion, temporal clustering  ← no heavy deps
-  util.py         Filename/time helpers                   ← no heavy deps
+  store.py        SQLite segment metadata + inspect()      ← no heavy deps
+  util.py         Filename/time helpers                    ← no heavy deps
   extract.py      Frame sampling + scene-change gating
   ocr.py          On-screen text extraction (EasyOCR)
   transcribe.py   Speech-to-text (faster-whisper)
@@ -198,9 +254,10 @@ video_rag/
   explain.py      LLM-generated step-by-step guide
   clipper.py      ffmpeg clip cutting
   pipeline.py     Wires it all together (VideoRAGPipeline)
+  db.py           Database facade: search() / render_clip() / explain()
   evaluate.py     Recall@k / MRR / threshold calibration
-  cli.py          `videorag index` / `query` / `eval`
-tests/            140 tests, no model weights, runs in ~1s
+  cli.py          `videorag index` / `query` / `eval` / `inspect`
+tests/            190+ tests, no model weights, runs in ~1-2s
 examples/
   quickstart.py
 ```

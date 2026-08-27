@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--init", action="store_true", help="Write a starter label file at LABELS and exit"
     )
 
+    p_inspect = sub.add_parser(
+        "inspect",
+        help="Show what's indexed (videos, segment counts) without loading FAISS or torch",
+    )
+    p_inspect.add_argument("--index-path", default=None, help="Index folder (default: config)")
+
     return parser
 
 
@@ -109,6 +115,27 @@ def _run_query(args, pipeline) -> int:
     return 0
 
 
+def _run_inspect(args) -> int:
+    """Report what's indexed without constructing VideoRAGPipeline at all —
+    this is the payoff of SQLite-backed metadata: no FAISS, no torch, no cv2,
+    just the standard library's sqlite3 module."""
+    from .store import inspect as inspect_store
+
+    index_path = args.index_path or Config().index_path
+    report = inspect_store(index_path)
+    if not report["videos"]:
+        print(f"No index found at {index_path}.")
+        return 1
+
+    print(f"Index           : {index_path}")
+    print(f"Embedding model : {report['embedding_model']}")
+    print(f"Total segments  : {report['total_segments']}")
+    print("\nVideos:")
+    for name, count in sorted(report["videos"].items()):
+        print(f"  {name:30s} {count} segment(s)")
+    return 0
+
+
 def _run_eval(args, pipeline) -> int:
     from .evaluate import evaluate, load_labels, write_template
 
@@ -132,7 +159,13 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     _configure_logging(args.verbose, args.quiet)
 
-    # Imported here so `--help` doesn't pay for torch/faiss.
+    if args.command == "inspect":
+        # No pipeline construction at all: this command's entire point is
+        # answering "what's indexed" without the cost of importing cv2,
+        # faiss, or torch.
+        return _run_inspect(args)
+
+    # Imported here so `--help` (and `inspect`, above) don't pay for torch/faiss.
     from .index import IndexCompatibilityError
     from .pipeline import VideoRAGPipeline
 

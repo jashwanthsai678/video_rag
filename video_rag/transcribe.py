@@ -36,33 +36,60 @@ class SpeechTranscriber:
         return self._model
 
     def transcribe(self, video_path: str, video_name: str) -> List[Segment]:
-        segments_gen, info = self.model.transcribe(
-            video_path,
-            beam_size=5,
-            # Empty config value => auto-detect rather than forcing English.
-            language=self.config.whisper_language or None,
-        )
-        logger.info(
-            "Transcribing %s (detected language: %s)",
-            video_name,
-            getattr(info, "language", "unknown"),
-        )
+        import av
 
-        segments = []
-        for seg in segments_gen:
-            text = seg.text.strip()
-            if not text:
-                continue
-            segments.append(
-                Segment(
-                    video_name=video_name,
-                    video_path=video_path,
-                    timestamp=float(seg.start),
-                    end_timestamp=float(seg.end),
-                    text=text,
-                    source="speech",
-                    confidence=1.0,
-                )
+        if not self._has_audio_track(video_path):
+            logger.info("%s: no audio track; skipping transcription", video_name)
+            return []
+
+        try:
+            segments_gen, info = self.model.transcribe(
+                video_path,
+                beam_size=5,
+                # Empty config value => auto-detect rather than forcing English.
+                language=self.config.whisper_language or None,
             )
+            logger.info(
+                "Transcribing %s (detected language: %s)",
+                video_name,
+                getattr(info, "language", "unknown"),
+            )
+
+            segments = []
+            for seg in segments_gen:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                segments.append(
+                    Segment(
+                        video_name=video_name,
+                        video_path=video_path,
+                        timestamp=float(seg.start),
+                        end_timestamp=float(seg.end),
+                        text=text,
+                        source="speech",
+                        confidence=1.0,
+                    )
+                )
+        except (IndexError, av.error.FFmpegError):
+            # An audio stream was present but couldn't actually be decoded
+            # (corrupt/empty track). Same outcome as "no audio": OCR segments
+            # for this video should still be indexed, not lost.
+            logger.warning("%s: audio track present but undecodable; skipping transcription", video_name)
+            return []
+
         logger.info("%s: %d speech segment(s)", video_name, len(segments))
         return segments
+
+    @staticmethod
+    def _has_audio_track(video_path: str) -> bool:
+        """Cheap container probe so a silent video never triggers a Whisper
+        model load (weights download / GPU init) it has no use for."""
+        import av
+
+        try:
+            with av.open(video_path, mode="r", metadata_errors="ignore") as container:
+                return len(container.streams.audio) > 0
+        except av.error.FFmpegError:
+            logger.warning("%s: could not probe for an audio stream; assuming none", video_path)
+            return False
