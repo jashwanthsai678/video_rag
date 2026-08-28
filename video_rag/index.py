@@ -57,6 +57,12 @@ class SemanticIndex:
         # has to tokenize the segments actually being added, instead of the
         # `bm25` property re-tokenizing the whole corpus on every mutation.
         self._tokens: List[List[str]] = []
+        # How many of `self.segments` are already durably written to
+        # segments.db as of the last save()/load(). Lets save() append only
+        # the new rows instead of rewriting the whole metadata table, as long
+        # as nothing was removed in between (see save()).
+        self._store_synced_count: int = 0
+        self._removed_since_save: bool = False
 
     # --- Lazy heavy dependencies --------------------------------------------
 
@@ -149,6 +155,7 @@ class SemanticIndex:
         self.segments = [self.segments[i] for i in keep]
         self._tokens = [self._tokens[i] for i in keep]
         self._bm25 = None
+        self._removed_since_save = True
         logger.info("Removed %d segment(s) for %r", removed, video_name)
         return removed
 
@@ -212,13 +219,26 @@ class SemanticIndex:
     # `video_rag.store.inspect()`: answering "what's indexed here" needs
     # neither FAISS nor torch, just the standard library's sqlite3 module.
     #
-    # This still writes the full segment list on every save() rather than
-    # streaming individual add()/remove_video() calls straight to disk — the
-    # session's in-memory `self.segments` list stays the single source of
-    # truth, matching how the FAISS index itself is only flushed to disk on
-    # save(). Making metadata durable *before* an explicit save() would leave
-    # it out of sync with not-yet-flushed vectors, which is worse than the
-    # current all-or-nothing save.
+    # The FAISS half of every save() still serializes the *entire* vector
+    # index — that's inherent to FAISS's file format, which has no
+    # incremental/append form. The SQLite half doesn't have that
+    # constraint, so save() takes one of two paths for it:
+    #
+    #   - nothing removed since the last save: append only the segments
+    #     added since then (their faiss_position values are still valid,
+    #     since remove_video() is the only thing that renumbers them) —
+    #     the common case when a batch just keeps adding more videos.
+    #   - a remove_video() happened since the last save: full compact(),
+    #     since that call already renumbered every faiss_position and the
+    #     on-disk rows must follow.
+    #
+    # The full-rewrite path still goes through a tmp file + os.replace() so
+    # an interrupted save can't leave a half-written file. The append path
+    # writes directly to the live file: copying the whole existing file
+    # before every append would reintroduce the O(n) cost this exists to
+    # avoid. It relies on SQLite's own transaction (a rollback-journal that
+    # auto-recovers the pre-append state on the next open if the process
+    # dies mid-write) plus the integrity check in load().
 
     def save(self, path: str) -> None:
         if self.index is None:
@@ -233,16 +253,27 @@ class SemanticIndex:
         os.replace(tmp_index, os.path.join(path, INDEX_FILE))
 
         store_path = os.path.join(path, STORE_FILE)
-        tmp_store = store_path + ".tmp"
-        Path(tmp_store).unlink(missing_ok=True)
-        with SegmentStore(tmp_store) as store:
-            store.compact(self.segments)
-            store.set_meta("schema_version", str(SCHEMA_VERSION))
-            store.set_meta("embedding_model", self.config.embedding_model)
-            store.set_meta("dimension", str(self.index.d))
-        os.replace(tmp_store, store_path)
+        if self._removed_since_save:
+            tmp_store = store_path + ".tmp"
+            Path(tmp_store).unlink(missing_ok=True)
+            with SegmentStore(tmp_store) as store:
+                store.compact(self.segments)
+                self._set_store_meta(store)
+            os.replace(tmp_store, store_path)
+        else:
+            new_segments = self.segments[self._store_synced_count :]
+            with SegmentStore(store_path) as store:
+                store.append(new_segments, start_position=self._store_synced_count)
+                self._set_store_meta(store)
 
+        self._store_synced_count = len(self.segments)
+        self._removed_since_save = False
         logger.info("Saved %d segment(s) to %s", len(self.segments), path)
+
+    def _set_store_meta(self, store: SegmentStore) -> None:
+        store.set_meta("schema_version", str(SCHEMA_VERSION))
+        store.set_meta("embedding_model", self.config.embedding_model)
+        store.set_meta("dimension", str(self.index.d))
 
     def load(self, path: str) -> bool:
         index_file = os.path.join(path, INDEX_FILE)
@@ -274,5 +305,8 @@ class SemanticIndex:
         self.segments = segments
         self._tokens = [tokenize(s.text) for s in segments]
         self._bm25 = None
+        # Everything just loaded is, by definition, already durable.
+        self._store_synced_count = len(segments)
+        self._removed_since_save = False
         logger.info("Loaded %d segment(s) from %s", len(segments), path)
         return True

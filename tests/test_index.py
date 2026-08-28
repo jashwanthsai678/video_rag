@@ -248,6 +248,91 @@ class TestPersistence:
         assert any("Über" in s.text for s in reloaded.segments)
 
 
+class TestIncrementalSave:
+    """save() must not pay for a full metadata rewrite unless something was
+    actually removed since the last save."""
+
+    def _spy(self, monkeypatch):
+        calls = {"compact": 0, "append": 0}
+        orig_compact, orig_append = SegmentStore.compact, SegmentStore.append
+
+        def spy_compact(self, *a, **kw):
+            calls["compact"] += 1
+            return orig_compact(self, *a, **kw)
+
+        def spy_append(self, *a, **kw):
+            calls["append"] += 1
+            return orig_append(self, *a, **kw)
+
+        monkeypatch.setattr(SegmentStore, "compact", spy_compact)
+        monkeypatch.setattr(SegmentStore, "append", spy_append)
+        return calls
+
+    def test_a_second_save_after_add_appends_rather_than_recompacting(self, tmp_path, monkeypatch):
+        calls = self._spy(monkeypatch)
+        idx_path = str(tmp_path / "idx")
+
+        index = make_index(index_path=idx_path)
+        index.save(idx_path)  # first save: nothing to compact, appends everything
+        assert calls == {"compact": 0, "append": 1}
+
+        index.add([
+            Segment(
+                video_name="patients", video_path="v.mp4", timestamp=99.0,
+                text="Print the invoice", source="ocr",
+            )
+        ])
+        index.save(idx_path)
+        assert calls == {"compact": 0, "append": 2}
+
+        reloaded = SemanticIndex(index.config)
+        reloaded._model = FakeEncoder()
+        reloaded.load(idx_path)
+        assert len(reloaded.segments) == len(SEGMENT_TEXTS) + 1
+        assert any("invoice" in s.text for s in reloaded.segments)
+
+    def test_a_removal_forces_a_full_compact_on_the_next_save(self, tmp_path, monkeypatch):
+        calls = self._spy(monkeypatch)
+        idx_path = str(tmp_path / "idx")
+
+        index = make_index(index_path=idx_path)
+        index.save(idx_path)
+        index.remove_video("reports")
+        index.save(idx_path)
+        # append (1st save) + compact (2nd save, which itself calls append
+        # internally to write the rebuilt rows - see SegmentStore.compact).
+        assert calls == {"compact": 1, "append": 2}
+
+        reloaded = SemanticIndex(index.config)
+        reloaded._model = FakeEncoder()
+        reloaded.load(idx_path)
+        assert {s.video_name for s in reloaded.segments} == {"patients"}
+        assert reloaded.index.ntotal == len(reloaded.segments)
+
+    def test_appended_rows_land_at_the_correct_faiss_positions(self, tmp_path):
+        """A regression here would silently misalign segments.db rows with
+        their FAISS vector rows on the second and later save(). Checked
+        directly against the reloaded segment order/content rather than via
+        search() - ranking is fuzzy by design and isn't the concern here."""
+        idx_path = str(tmp_path / "idx")
+        index = make_index(index_path=idx_path)
+        index.save(idx_path)
+        index.add([
+            Segment(
+                video_name="patients", video_path="v.mp4", timestamp=99.0,
+                text="Print the invoice", source="ocr",
+            )
+        ])
+        index.save(idx_path)
+
+        reloaded = SemanticIndex(index.config)
+        reloaded._model = FakeEncoder()
+        reloaded.load(idx_path)
+        assert len(reloaded.segments) == len(SEGMENT_TEXTS) + 1
+        assert reloaded.segments[len(SEGMENT_TEXTS)].text == "Print the invoice"
+        assert reloaded.segments[len(SEGMENT_TEXTS)].timestamp == 99.0
+
+
 class TestAddGuards:
     def test_adding_nothing_is_a_no_op(self):
         index = make_index()
