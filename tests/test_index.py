@@ -6,6 +6,7 @@ the goal is to test *our* wiring (fusion, rebuild-on-remove, persistence,
 compatibility guards), not the quality of somebody else's weights.
 """
 
+import json
 import re
 
 import pytest
@@ -14,7 +15,12 @@ np = pytest.importorskip("numpy")
 pytest.importorskip("faiss")
 
 from video_rag.config import Config  # noqa: E402
-from video_rag.index import IndexCompatibilityError, SemanticIndex  # noqa: E402
+from video_rag.index import (  # noqa: E402
+    MANIFEST_FILE,
+    STORE_FILE,
+    IndexCompatibilityError,
+    SemanticIndex,
+)
 from video_rag.retrieval import tokenize  # noqa: E402
 from video_rag.segment import Segment  # noqa: E402
 from video_rag.store import SegmentStore, inspect  # noqa: E402
@@ -398,3 +404,84 @@ class TestTokenCache:
         index.remove_video("patients")
         index.remove_video("reports")
         assert index._tokens == []
+
+
+class TestManifest:
+    """load() must refuse a save that was interrupted before completion,
+    rather than trusting whatever partial state made it to disk."""
+
+    def test_a_normal_save_load_roundtrip_succeeds(self, tmp_path):
+        index = make_index(index_path=str(tmp_path / "idx"))
+        index.save(str(tmp_path / "idx"))
+
+        reloaded = SemanticIndex(index.config)
+        reloaded._model = FakeEncoder()
+        assert reloaded.load(str(tmp_path / "idx")) is True
+
+    def test_save_writes_a_manifest(self, tmp_path):
+        index = make_index()
+        index.save(str(tmp_path / "idx"))
+
+        manifest = json.loads((tmp_path / "idx" / MANIFEST_FILE).read_text(encoding="utf-8"))
+        assert manifest["complete"] is True
+        assert manifest["segment_count"] == len(SEGMENT_TEXTS)
+        assert manifest["dimension"] == index.index.d
+
+    def test_missing_manifest_on_a_current_schema_index_is_refused(self, tmp_path):
+        """Simulates a crash after the SQLite rename but before the manifest
+        was written - the count check alone would not catch this."""
+        idx_path = tmp_path / "idx"
+        index = make_index()
+        index.save(str(idx_path))
+        (idx_path / MANIFEST_FILE).unlink()
+
+        reloaded = SemanticIndex(index.config)
+        with pytest.raises(IndexCompatibilityError, match="interrupted"):
+            reloaded.load(str(idx_path))
+
+    def test_generation_mismatch_is_refused(self, tmp_path):
+        """Simulates a store left over from an earlier, different save()
+        than the one the manifest actually describes - same segment count,
+        different save. Only the generation check catches this."""
+        idx_path = tmp_path / "idx"
+        index = make_index()
+        index.save(str(idx_path))
+
+        manifest_path = idx_path / MANIFEST_FILE
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["generation"] = "not-the-real-generation"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        reloaded = SemanticIndex(index.config)
+        with pytest.raises(IndexCompatibilityError, match="interrupted"):
+            reloaded.load(str(idx_path))
+
+    def test_incomplete_manifest_is_refused(self, tmp_path):
+        idx_path = tmp_path / "idx"
+        index = make_index()
+        index.save(str(idx_path))
+
+        manifest_path = idx_path / MANIFEST_FILE
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["complete"] = False
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        reloaded = SemanticIndex(index.config)
+        with pytest.raises(IndexCompatibilityError, match="interrupted"):
+            reloaded.load(str(idx_path))
+
+    def test_a_legacy_index_without_a_manifest_still_loads(self, tmp_path):
+        """An index saved before this schema version existed has no
+        manifest and no generation meta key at all - must not be refused."""
+        idx_path = tmp_path / "idx"
+        index = make_index()
+        index.save(str(idx_path))
+        (idx_path / MANIFEST_FILE).unlink()
+
+        with SegmentStore(str(idx_path / STORE_FILE)) as store:
+            store.set_meta("schema_version", "3")
+            store._conn.execute("DELETE FROM meta WHERE key = 'generation'")
+            store._conn.commit()
+
+        reloaded = SemanticIndex(index.config)
+        assert reloaded.load(str(idx_path)) is True

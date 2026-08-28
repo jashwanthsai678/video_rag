@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -19,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 INDEX_FILE = "index.faiss"
 STORE_FILE = "segments.db"
-SCHEMA_VERSION = 3
+# Written last, after both the FAISS and SQLite files have been renamed into
+# place - the actual commit point of save(). Its presence (and a matching
+# `generation`) is what load() uses to tell "fully saved" apart from
+# "interrupted partway through", which the FAISS-count/segment-count check
+# alone can't always catch (see save()/load()).
+MANIFEST_FILE = "manifest.json"
+SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -245,6 +253,12 @@ class SemanticIndex:
             logger.warning("Nothing to save: index is empty")
             return
 
+        # Identifies this specific save. Written into segments.db's meta
+        # table below and cross-checked against the manifest on load(): if
+        # they don't match, the store and the manifest belong to different
+        # save() calls, which only happens when one was interrupted.
+        generation = uuid.uuid4().hex
+
         os.makedirs(path, exist_ok=True)
         # Write to a temporary file and swap, so an interrupted save can't
         # leave a half-written index that fails to load next run.
@@ -258,22 +272,39 @@ class SemanticIndex:
             Path(tmp_store).unlink(missing_ok=True)
             with SegmentStore(tmp_store) as store:
                 store.compact(self.segments)
-                self._set_store_meta(store)
+                self._set_store_meta(store, generation)
             os.replace(tmp_store, store_path)
         else:
             new_segments = self.segments[self._store_synced_count :]
             with SegmentStore(store_path) as store:
                 store.append(new_segments, start_position=self._store_synced_count)
-                self._set_store_meta(store)
+                self._set_store_meta(store, generation)
+
+        # The true commit point: written last, after both files above are
+        # already durably in place. A crash before this line means the
+        # manifest doesn't reflect this save, which load() treats as
+        # incomplete rather than trusting whatever's on disk.
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "generation": generation,
+            "segment_count": len(self.segments),
+            "embedding_model": self.config.embedding_model,
+            "dimension": self.index.d,
+            "complete": True,
+        }
+        tmp_manifest = os.path.join(path, MANIFEST_FILE + ".tmp")
+        Path(tmp_manifest).write_text(json.dumps(manifest), encoding="utf-8")
+        os.replace(tmp_manifest, os.path.join(path, MANIFEST_FILE))
 
         self._store_synced_count = len(self.segments)
         self._removed_since_save = False
         logger.info("Saved %d segment(s) to %s", len(self.segments), path)
 
-    def _set_store_meta(self, store: SegmentStore) -> None:
+    def _set_store_meta(self, store: SegmentStore, generation: str) -> None:
         store.set_meta("schema_version", str(SCHEMA_VERSION))
         store.set_meta("embedding_model", self.config.embedding_model)
         store.set_meta("dimension", str(self.index.d))
+        store.set_meta("generation", generation)
 
     def load(self, path: str) -> bool:
         index_file = os.path.join(path, INDEX_FILE)
@@ -283,6 +314,8 @@ class SemanticIndex:
 
         with SegmentStore(store_file) as store:
             saved_model = store.get_meta("embedding_model")
+            saved_schema_version = store.get_meta("schema_version")
+            saved_generation = store.get_meta("generation")
             segments = store.all_segments()
 
         if saved_model and saved_model != self.config.embedding_model:
@@ -301,6 +334,8 @@ class SemanticIndex:
                 f"{len(segments)} segment(s). Delete the index directory and re-index."
             )
 
+        self._check_manifest(path, index, segments, saved_schema_version, saved_generation)
+
         self.index = index
         self.segments = segments
         self._tokens = [tokenize(s.text) for s in segments]
@@ -310,3 +345,51 @@ class SemanticIndex:
         self._removed_since_save = False
         logger.info("Loaded %d segment(s) from %s", len(segments), path)
         return True
+
+    def _check_manifest(
+        self,
+        path: str,
+        index,
+        segments: List[Segment],
+        saved_schema_version: Optional[str],
+        saved_generation: Optional[str],
+    ) -> None:
+        """Refuse to load a save() that was interrupted before completion.
+
+        The ntotal/segment-count check in load() catches most incomplete
+        saves, but not the narrow case of a crash between the SQLite and
+        manifest writes followed by a later, unrelated save whose count
+        happens to coincide - only the generation check below catches that.
+        """
+        manifest_path = os.path.join(path, MANIFEST_FILE)
+        version = int(saved_schema_version) if saved_schema_version else 0
+
+        if not os.path.exists(manifest_path):
+            if version < 4:
+                # Saved by a version of this code that predates the
+                # manifest; nothing more to check than what load() already
+                # verified above.
+                return
+            raise IndexCompatibilityError(
+                f"Index at {path} has no manifest but claims schema version "
+                f"{version} - the save that produced it was interrupted before "
+                f"completion. Delete the index directory and re-index."
+            )
+
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        mismatches = []
+        if not manifest.get("complete"):
+            mismatches.append("manifest is marked incomplete")
+        if manifest.get("generation") != saved_generation:
+            mismatches.append("manifest generation does not match the saved store")
+        if manifest.get("segment_count") != len(segments):
+            mismatches.append("manifest segment count does not match the saved store")
+        if manifest.get("dimension") != index.d:
+            mismatches.append("manifest dimension does not match the saved index")
+
+        if mismatches:
+            raise IndexCompatibilityError(
+                f"Index at {path} failed its integrity check ({'; '.join(mismatches)}) "
+                f"- the save that produced it was interrupted before completion. "
+                f"Delete the index directory and re-index."
+            )

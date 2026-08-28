@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .config import Config
-from .index import INDEX_FILE, STORE_FILE
+from .index import INDEX_FILE, MANIFEST_FILE, STORE_FILE
 from .pipeline import VideoRAGPipeline
 from .segment import Segment
 
@@ -92,7 +92,7 @@ class Database:
             # leave the pre-removal index files on disk claiming stale
             # content. Clear them explicitly instead.
             index_dir = self._pipeline.config.index_path
-            for name_ in (INDEX_FILE, STORE_FILE):
+            for name_ in (INDEX_FILE, STORE_FILE, MANIFEST_FILE):
                 path = os.path.join(index_dir, name_)
                 if os.path.exists(path):
                     os.remove(path)
